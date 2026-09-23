@@ -1,0 +1,12 @@
+# Exclusions propres au plugin acme, ajoutées à celles de deploy-plugin.sh.
+# Un motif rsync par ligne ; les lignes vides et celles commençant par # sont
+# ignorées par --exclude-from.
+
+# Clés du compte ACME et certificats émis, produits à l'exécution. Sans cette
+# exclusion, la synchronisation à l'identique (--delete) effacerait les clés
+# privées à chaque déploiement, puisque le dépôt n'en contient aucune.
+data/
+
+# Les contrôles et essais ne servent qu'au développement : rien à faire dans la
+# racine web. (CONCEPTION.md est déjà exclu, comme tout *.md de la racine.)
+tests/

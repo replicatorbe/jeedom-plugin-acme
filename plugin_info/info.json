@@ -1,0 +1,33 @@
+{
+    "id": "acme",
+    "name": "ACME (Let's Encrypt)",
+    "pluginVersion": "0.1",
+    "description": {
+        "fr_FR": "Obtient et renouvelle automatiquement un certificat TLS gratuit pour votre Jeedom auprès de Let's Encrypt, de ZeroSSL ou de toute autorité ACME, puis l'installe dans le serveur web pour passer en HTTPS. Validation DNS-01 par l'API OVHcloud (aucun port à ouvrir, wildcard possible) ou HTTP-01. Aucune dépendance : PHP seul.",
+        "en_US": "Automatically obtains and renews a free TLS certificate for your Jeedom from Let's Encrypt, ZeroSSL or any ACME authority, then installs it in the web server to switch to HTTPS. DNS-01 validation through the OVHcloud API (no port to open, wildcards allowed) or HTTP-01. No dependency: plain PHP only."
+    },
+    "licence": "AGPL",
+    "author": "sMug (Jérôme Fafchamps)",
+    "require": "4.4",
+    "requireOsVersion": "11",
+    "category": "security",
+    "index": "acme",
+    "hasDependency": 0,
+    "hasOwnDeamon": 0,
+    "eventjs": 0,
+    "issue": "https://github.com/replicatorbe/jeedom-plugin-acme/issues",
+    "documentation": "https://github.com/replicatorbe/jeedom-plugin-acme/blob/master/docs/#language#/index.md",
+    "changelog": "https://github.com/replicatorbe/jeedom-plugin-acme/blob/master/docs/#language#/changelog.md",
+    "documentation_beta": "https://github.com/replicatorbe/jeedom-plugin-acme/blob/beta/docs/#language#/index.md",
+    "changelog_beta": "https://github.com/replicatorbe/jeedom-plugin-acme/blob/beta/docs/#language#/changelog.md",
+    "language": [
+        "fr_FR",
+        "en_US"
+    ],
+    "compatibility": [
+        "smart",
+        "rpi",
+        "docker",
+        "diy"
+    ]
+}

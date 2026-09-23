@@ -1,0 +1,24 @@
+/* Page du plugin ACME. Couleurs tirées des variables du thème de Jeedom, pour
+   suivre les thèmes clair et sombre. */
+
+/* Journal de la tâche de fond : dernières lignes, les plus récentes en bas. */
+.acme-joblog {
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* --bg-color est un triplet « r, g, b » (thèmes du coeur), pas une couleur :
+     il s'emploie dans rgba(), comme le fait desktop.main.css. */
+  background: rgba(var(--bg-color), .6);
+  color: var(--txt-color, inherit);
+  border-radius: var(--border-radius, 4px);
+  margin-top: 8px;
+}
+.acme-joblog .acme-warning { color: var(--al-warning-color, #f0ad4e); }
+.acme-joblog .acme-error { color: var(--al-danger-color, #d9534f); font-weight: bold; }
+
+/* Tableau d'état du certificat. */
+.acme-certtable td:first-child { width: 190px; font-weight: bold; }
+.acme-certtable { margin-bottom: 8px; }
