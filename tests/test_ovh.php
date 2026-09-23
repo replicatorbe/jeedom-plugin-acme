@@ -268,6 +268,82 @@ check('removeTxt après listTxt : suppression directe, sans relecture', $after =
 $ovh->commit();
 check('removeTxt après listTxt : zone republiée', end($srv->requests)['path'] === '/domain/zone/example.org/refresh');
 
+// recordId : identifiant retenu à la création (pour le fichier d'état du solveur).
+$srv = new fakeOvh();
+$srv->routes['GET /domain/zone'] = ok(array('example.org'));
+$srv->routes['POST /domain/zone/example.org/record'] = ok(array('id' => 4242));
+$ovh = new acmeDnsOvh($config, $logger);
+$ovh->setTransport($srv);
+check('méthodes facultatives recordId et removeTxtById présentes', method_exists($ovh, 'recordId') && method_exists($ovh, 'removeTxtById'));
+check('recordId avant addTxt : null', $ovh->recordId('_acme-challenge.jeedom.example.org', 'valeurA') === null);
+$ovh->addTxt('_acme-challenge.jeedom.example.org', 'valeurA');
+check('recordId après addTxt : id OVH', $ovh->recordId('_acme-challenge.jeedom.example.org.', 'valeurA') === '4242');
+check('recordId d\'une autre valeur : null', $ovh->recordId('_acme-challenge.jeedom.example.org', 'valeurB') === null);
+
+// removeTxtById : vérifie l'enregistrement (nom, valeur) puis le supprime, sans recherche.
+$srv = new fakeOvh();
+$srv->routes['GET /domain/zone'] = ok(array('example.org'));
+$srv->routes['GET /domain/zone/example.org/record/31'] = ok(array('id' => 31, 'fieldType' => 'TXT',
+    'subDomain' => '_acme-challenge.jeedom', 'target' => '"valeurA"'));
+$srv->routes['DELETE /domain/zone/example.org/record/31'] = array('code' => 200, 'body' => 'null');
+$srv->routes['POST /domain/zone/example.org/refresh'] = array('code' => 200, 'body' => 'null');
+$ovh = new acmeDnsOvh($config, $logger);
+$ovh->setTransport($srv);
+$removed = $ovh->removeTxtById('_acme-challenge.jeedom.example.org', 'valeurA', '31');
+$ovh->commit();
+check('removeTxtById : true', $removed === true);
+check('removeTxtById : GET puis DELETE par id, sans recherche, puis refresh', $srv->calls() === array(
+    'GET /auth/time', 'GET /domain/zone', 'GET /domain/zone/example.org/record/31',
+    'DELETE /domain/zone/example.org/record/31', 'POST /domain/zone/example.org/refresh'), implode(', ', $srv->calls()));
+
+// removeTxtById : enregistrement déjà supprimé (404) → false, sans erreur ni refresh.
+$srv = new fakeOvh();
+$srv->routes['GET /domain/zone'] = ok(array('example.org'));
+$ovh = new acmeDnsOvh($config, $logger);
+$ovh->setTransport($srv);
+$removed = null;
+$threw = false;
+try {
+    $removed = $ovh->removeTxtById('_acme-challenge.jeedom.example.org', 'valeurA', '32');
+    $ovh->commit();
+} catch (acmeException $e) {
+    $threw = true;
+}
+check('removeTxtById : id inconnu → false sans erreur', !$threw && $removed === false);
+check('removeTxtById : id inconnu → ni DELETE ni refresh', count(array_filter($srv->calls(), function ($c) {
+    return strpos($c, 'DELETE') === 0 || strpos($c, '/refresh') !== false; })) == 0, implode(', ', $srv->calls()));
+
+// removeTxtById : l'id désigne un autre TXT (valeur d'un autre outil) → jamais supprimé ;
+// recherche par nom et valeur exacte à la place.
+$srv = new fakeOvh();
+$srv->routes['GET /domain/zone'] = ok(array('example.org'));
+$srv->routes['GET /domain/zone/example.org/record/33'] = ok(array('id' => 33, 'fieldType' => 'TXT',
+    'subDomain' => '_acme-challenge.jeedom', 'target' => str_repeat('c', 43)));
+$srv->routes['GET /domain/zone/example.org/record?fieldType=TXT&subDomain=_acme-challenge.jeedom'] = ok(array(33, 34));
+$srv->routes['GET /domain/zone/example.org/record/34'] = ok(array('id' => 34, 'target' => '"valeurA"'));
+$srv->routes['DELETE /domain/zone/example.org/record/34'] = array('code' => 200, 'body' => 'null');
+$ovh = new acmeDnsOvh($config, $logger);
+$ovh->setTransport($srv);
+$removed = $ovh->removeTxtById('_acme-challenge.jeedom.example.org', 'valeurA', '33');
+$calls = $srv->calls();
+check('removeTxtById : id réattribué → TXT étranger conservé', !in_array('DELETE /domain/zone/example.org/record/33', $calls, true),
+    implode(', ', $calls));
+check('removeTxtById : id réattribué → retrait par valeur exacte', $removed === true
+    && in_array('DELETE /domain/zone/example.org/record/34', $calls, true), implode(', ', $calls));
+
+// removeTxt ne supprime que la valeur exacte : un TXT de forme ACME d'un autre outil reste.
+$srv = new fakeOvh();
+$srv->routes['GET /domain/zone'] = ok(array('example.org'));
+$srv->routes['GET /domain/zone/example.org/record?fieldType=TXT&subDomain=_acme-challenge.jeedom'] = ok(array(41, 42));
+$srv->routes['GET /domain/zone/example.org/record/41'] = ok(array('id' => 41, 'target' => str_repeat('d', 43)));
+$srv->routes['GET /domain/zone/example.org/record/42'] = ok(array('id' => 42, 'target' => str_repeat('e', 43)));
+$srv->routes['DELETE /domain/zone/example.org/record/42'] = array('code' => 200, 'body' => 'null');
+$ovh = new acmeDnsOvh($config, $logger);
+$ovh->setTransport($srv);
+$ovh->removeTxt('_acme-challenge.jeedom.example.org', str_repeat('e', 43));
+check('removeTxt : TXT ACME d\'un autre outil conservé', !in_array('DELETE /domain/zone/example.org/record/41', $srv->calls(), true)
+    && in_array('DELETE /domain/zone/example.org/record/42', $srv->calls(), true), implode(', ', $srv->calls()));
+
 // Cible d'un CNAME de délégation dans une zone absente du compte : erreur claire.
 $srv = new fakeOvh();
 $srv->routes['GET /domain/zone'] = ok(array('example.org'));

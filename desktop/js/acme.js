@@ -230,6 +230,24 @@ function acmeRenderCert(_cert, _test) {
   } else if (_cert.installed_at) {
     table.appendChild(acmeRow('{{Installé dans le serveur web}}', _cert.installed_at))
   }
+  /* served : résultat du dernier contrôle de ce que le serveur web présente
+     réellement (sonde TLS locale) ; null quand la question ne se pose pas. */
+  if (_cert.served === true || _cert.served === false) {
+    var probe = document.createElement('span')
+    if (_cert.served) {
+      probe.appendChild(acmeLabel('{{Oui}}', 'success'))
+    } else if (_cert.served_error) {
+      probe.appendChild(acmeLabel('{{Non : serveur web injoignable}}', 'danger'))
+      probe.appendChild(document.createTextNode(' ' + acmeText(_cert.served_error)))
+    } else {
+      probe.appendChild(acmeLabel('{{Non : autre certificat servi}}', 'danger'))
+      probe.appendChild(document.createTextNode(' {{numéro de série}} ' + acmeText(_cert.served_serial)))
+    }
+    if (_cert.served_checked) {
+      probe.appendChild(document.createTextNode(' ({{contrôlé le}} ' + acmeText(_cert.served_checked) + ')'))
+    }
+    table.appendChild(acmeRow('{{Certificat servi par le serveur web}}', probe))
+  }
   /* L'émission et l'installation échouent séparément : un certificat obtenu
      mais refusé par le serveur web n'est pas un renouvellement en échec. */
   if (_cert.last_error) {

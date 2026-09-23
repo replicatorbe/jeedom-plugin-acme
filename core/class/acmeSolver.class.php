@@ -351,8 +351,12 @@ class acmeSolverDns extends acmeSolver {
      * qu'aucun délai supplémentaire n'est configuré. */
     const UNKNOWN_SAFETY_DELAY = 60;
 
-    /* Valeur TXT d'un défi ACME (43 caractères base64url), guillemets tolérés. */
+    /* Valeur TXT d'un défi ACME (43 caractères base64url), guillemets tolérés.
+     * Sert seulement au journal : un TXT n'est jamais retiré d'après sa forme. */
     const ACME_VALUE_PATTERN = '/^"?[A-Za-z0-9_-]{43}"?$/';
+
+    /* Version du format du fichier d'état. */
+    const STATE_VERSION = 1;
 
     /** @var acmeDnsProvider */
     protected $provider;
@@ -361,21 +365,38 @@ class acmeSolverDns extends acmeSolver {
 
     /* Enregistrements posés : liste de ['fqdn' (nom réellement écrit, cible
      * du CNAME éventuel), 'value', 'domain', 'name' (_acme-challenge.<domaine>,
-     * nom vérifié comme le fait l'autorité)]. */
+     * nom vérifié comme le fait l'autorité), 'id' (identifiant fournisseur ou
+     * null)]. */
     protected $records = array();
 
-    /* Noms déjà débarrassés de leurs TXT ACME orphelins (fqdn => true). */
-    protected $purged = array();
+    /* Enregistrements posés et pas encore retirés, tels que listés dans le
+     * fichier d'état : liste de ['fqdn', 'value', 'id', 'created'] ; null tant
+     * que le fichier n'a pas été lu. */
+    protected $pending = null;
+
+    /* Vrai quand les restes d'une tâche précédente ont été traités. */
+    protected $leftoversDone = false;
+
+    /* Noms dont les TXT ont déjà été passés en revue (fqdn => true). */
+    protected $inspected = array();
 
     /* Zones dont les serveurs DNS ont déjà été contrôlés (zone => true). */
     protected $checkedZones = array();
 
-    /* Vrai quand des retraits restent à publier (orphelins). */
+    /* Vrai quand des retraits restent à publier (restes). */
     protected $dirty = false;
 
-    /* options : 'propagationTimeout' (s, défaut 300), 'pollInterval' (s,
+    /*
+     * options : 'propagationTimeout' (s, défaut 300), 'pollInterval' (s,
      * défaut 10), 'checkPropagation' (bool, défaut true), 'extraDelay' (s,
-     * défaut 0) */
+     * défaut 0), 'stateFile' (chemin d'un fichier JSON, défaut '' : aucun).
+     *
+     * stateFile liste les TXT posés par le plugin et pas encore retirés. Au
+     * premier prepare(), les entrées laissées par une tâche interrompue sont
+     * retirées chez le fournisseur ; rien d'autre ne l'est jamais (d'autres
+     * outils, certbot par exemple, posent des TXT de même forme sur le même
+     * nom). Sans stateFile, aucun reste n'est recherché.
+     */
     public function __construct(acmeDnsProvider $provider, array $options = array()) {
         $this->provider = $provider;
         $options = array_merge(array(
@@ -383,12 +404,14 @@ class acmeSolverDns extends acmeSolver {
             'pollInterval' => 10,
             'checkPropagation' => true,
             'extraDelay' => 0,
+            'stateFile' => '',
         ), $options);
         $this->options = array(
             'propagationTimeout' => max(0, (int) $options['propagationTimeout']),
             'pollInterval' => max(1, (int) $options['pollInterval']),
             'checkPropagation' => (bool) $options['checkPropagation'],
             'extraDelay' => max(0, (int) $options['extraDelay']),
+            'stateFile' => is_string($options['stateFile']) ? trim($options['stateFile']) : '',
         );
     }
 
@@ -439,14 +462,24 @@ class acmeSolverDns extends acmeSolver {
         }
 
         $this->checkNameServers($fqdn);
-        $this->purgeOrphans($fqdn);
+        $this->removeLeftovers();
+        $this->inspectName($fqdn);
 
-        // Retenu avant l'appel : cleanup() tentera le retrait même si addTxt()
-        // échoue à mi-chemin.
-        $this->records[] = array('fqdn' => $fqdn, 'value' => $value, 'domain' => $domain, 'name' => $name);
+        // Retenu (en mémoire et dans le fichier d'état) avant l'appel :
+        // cleanup() tentera le retrait même si addTxt() échoue à mi-chemin, et
+        // une tâche interrompue laisse un reste listé plutôt qu'un
+        // enregistrement inconnu.
+        $this->records[] = array('fqdn' => $fqdn, 'value' => $value, 'domain' => $domain, 'name' => $name,
+            'id' => null);
+        $this->rememberPending($fqdn, $value, null);
         $this->log('info', 'Défi DNS-01 : TXT ' . $fqdn . ' = ' . $value);
         try {
             $this->provider->addTxt($fqdn, $value);
+            $id = $this->providerRecordId($fqdn, $value);
+            if ($id !== null) {
+                $this->records[count($this->records) - 1]['id'] = $id;
+                $this->rememberPending($fqdn, $value, $id);
+            }
         } catch (Throwable $e) {
             if ($fqdn === $name) {
                 throw $e;
@@ -583,8 +616,11 @@ class acmeSolverDns extends acmeSolver {
         foreach ($this->records as $r) {
             try {
                 $this->provider->removeTxt($r['fqdn'], $r['value']);
+                $this->forgetPending($r['fqdn'], $r['value']);
             } catch (Throwable $e) {
-                $this->log('error', 'Retrait du TXT ' . $r['fqdn'] . ' impossible : ' . $e->getMessage());
+                // Reste listé dans le fichier d'état : retiré à la prochaine tâche.
+                $this->log('error', 'Retrait du TXT ' . $r['fqdn'] . ' impossible : ' . $e->getMessage()
+                    . ($this->options['stateFile'] !== '' ? ' (nouvel essai à la prochaine tâche)' : ''));
             }
         }
         $this->records = array();
@@ -597,22 +633,73 @@ class acmeSolverDns extends acmeSolver {
     }
 
     /*
-     * Retire, au premier passage sur un nom, les valeurs ACME laissées par un
-     * essai interrompu (si le fournisseur sait lister : listTxt()).
+     * Retire, au premier prepare(), les TXT listés dans le fichier d'état :
+     * posés par une tâche précédente interrompue avant son nettoyage. Seules
+     * ces entrées sont touchées, jamais un TXT reconnu à sa forme. Une entrée
+     * que le fournisseur ne connaît plus (retirée à la main) quitte la liste
+     * sans erreur ; une entrée dont le retrait échoue y reste (nouvel essai à
+     * la prochaine tâche).
      */
-    protected function purgeOrphans(string $fqdn): void {
-        if (isset($this->purged[$fqdn])) {
+    protected function removeLeftovers(): void {
+        if ($this->leftoversDone) {
             return;
         }
-        $this->purged[$fqdn] = true;
+        $this->leftoversDone = true;
+        if ($this->options['stateFile'] === '') {
+            return;
+        }
+        $this->loadPending();
+        if (count($this->pending) == 0) {
+            return;
+        }
+        $this->log('info', count($this->pending) . " TXT d'une tâche précédente interrompue à retirer ("
+            . $this->options['stateFile'] . ')');
+        foreach ($this->pending as $entry) {
+            $label = $entry['fqdn'] . ' = ' . $entry['value']
+                . ($entry['id'] !== null ? ' (id ' . $entry['id'] . ')' : '')
+                . ($entry['created'] !== '' ? ', posé le ' . $entry['created'] : '');
+            try {
+                if ($entry['id'] !== null && method_exists($this->provider, 'removeTxtById')) {
+                    $removed = (bool) $this->provider->removeTxtById($entry['fqdn'], $entry['value'], $entry['id']);
+                } else {
+                    // Retrait par nom et valeur exacte : un TXT d'une autre
+                    // valeur n'est jamais concerné.
+                    $this->provider->removeTxt($entry['fqdn'], $entry['value']);
+                    $removed = true;
+                }
+            } catch (Throwable $e) {
+                $this->log('warning', "Retrait du reste d'une tâche précédente impossible : " . $label . ' : '
+                    . $e->getMessage() . ' (nouvel essai à la prochaine tâche)');
+                continue;
+            }
+            if ($removed) {
+                $this->dirty = true;
+                $this->log('info', "Reste d'une tâche précédente retiré : " . $label);
+            } else {
+                $this->log('info', "Reste d'une tâche précédente déjà absent chez le fournisseur, retiré de la liste : "
+                    . $label);
+            }
+            $this->forgetPending($entry['fqdn'], $entry['value']);
+        }
+    }
+
+    /*
+     * Journal seulement, au premier passage sur un nom (si le fournisseur sait
+     * lister : listTxt()) : signale les TXT de forme ACME posés par un autre
+     * outil, laissés en place.
+     */
+    protected function inspectName(string $fqdn): void {
+        if (isset($this->inspected[$fqdn])) {
+            return;
+        }
+        $this->inspected[$fqdn] = true;
         if (!method_exists($this->provider, 'listTxt')) {
             return;
         }
         try {
             $values = $this->provider->listTxt($fqdn);
         } catch (Throwable $e) {
-            $this->log('warning', 'Liste des TXT de ' . $fqdn . ' impossible (orphelins non recherchés) : '
-                . $e->getMessage());
+            $this->log('debug', 'Liste des TXT de ' . $fqdn . ' impossible : ' . $e->getMessage());
             return;
         }
         foreach (is_array($values) ? $values : array() as $v) {
@@ -621,15 +708,145 @@ class acmeSolverDns extends acmeSolver {
                 continue;
             }
             $v = trim($v, '"');
-            try {
-                $this->provider->removeTxt($fqdn, $v);
-                $this->dirty = true;
-                $this->log('info', "TXT orphelin d'un essai précédent retiré : " . $fqdn . ' = ' . $v);
-            } catch (Throwable $e) {
-                $this->log('warning', 'Retrait du TXT orphelin ' . $fqdn . ' = ' . $v . ' impossible : '
-                    . $e->getMessage());
+            if ($this->isPending($fqdn, $v)) {
+                continue;
+            }
+            $this->log('debug', "TXT d'un autre outil laissé en place : " . $fqdn . ' = ' . $v);
+        }
+    }
+
+    /* Identifiant fournisseur du TXT tout juste posé (facultatif :
+     * recordId()), ou null. */
+    protected function providerRecordId(string $fqdn, string $value): ?string {
+        if (!method_exists($this->provider, 'recordId')) {
+            return null;
+        }
+        try {
+            $id = $this->provider->recordId($fqdn, $value);
+        } catch (Throwable $e) {
+            return null;
+        }
+        return $id === null || $id === '' ? null : (string) $id;
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* Fichier d'état : {"version": 1, "records": [{"fqdn", "value", "id",
+     * "created"}]}. Écrit en 0600, par fichier temporaire et rename(). */
+
+    /* Lit le fichier d'état une fois ; illisible ou invalide : liste vide. */
+    protected function loadPending(): void {
+        if ($this->pending !== null) {
+            return;
+        }
+        $this->pending = array();
+        $file = $this->options['stateFile'];
+        if ($file === '' || !file_exists($file)) {
+            return;
+        }
+        $raw = @file_get_contents($file);
+        $data = is_string($raw) ? json_decode($raw, true) : null;
+        if (!is_array($data) || !isset($data['records']) || !is_array($data['records'])) {
+            $this->log('warning', "Fichier d'état DNS illisible, ignoré (les restes éventuels d'une tâche "
+                . 'précédente ne seront pas retirés) : ' . $file);
+            return;
+        }
+        foreach ($data['records'] as $r) {
+            if (!is_array($r) || !isset($r['fqdn'], $r['value']) || !is_string($r['fqdn']) || !is_string($r['value'])
+                || $r['fqdn'] === '' || $r['value'] === '') {
+                continue;
+            }
+            $id = isset($r['id']) && (is_string($r['id']) || is_int($r['id'])) && (string) $r['id'] !== ''
+                ? (string) $r['id'] : null;
+            $this->pending[] = array(
+                'fqdn' => $r['fqdn'],
+                'value' => $r['value'],
+                'id' => $id,
+                'created' => isset($r['created']) && is_string($r['created']) ? $r['created'] : '',
+            );
+        }
+    }
+
+    protected function isPending(string $fqdn, string $value): bool {
+        foreach (is_array($this->pending) ? $this->pending : array() as $p) {
+            if ($p['fqdn'] === $fqdn && $p['value'] === $value) {
+                return true;
             }
         }
+        return false;
+    }
+
+    /* Ajoute (ou complète de son identifiant) une entrée, puis écrit. */
+    protected function rememberPending(string $fqdn, string $value, ?string $id): void {
+        if ($this->options['stateFile'] === '') {
+            return;
+        }
+        $this->loadPending();
+        foreach ($this->pending as $i => $p) {
+            if ($p['fqdn'] === $fqdn && $p['value'] === $value) {
+                if ($id === null || $p['id'] === $id) {
+                    return;
+                }
+                $this->pending[$i]['id'] = $id;
+                $this->savePending();
+                return;
+            }
+        }
+        $this->pending[] = array('fqdn' => $fqdn, 'value' => $value, 'id' => $id, 'created' => date('c', $this->now()));
+        $this->savePending();
+    }
+
+    /* Retire une entrée, puis écrit. */
+    protected function forgetPending(string $fqdn, string $value): void {
+        if ($this->options['stateFile'] === '') {
+            return;
+        }
+        $this->loadPending();
+        $kept = array();
+        foreach ($this->pending as $p) {
+            if ($p['fqdn'] !== $fqdn || $p['value'] !== $value) {
+                $kept[] = $p;
+            }
+        }
+        if (count($kept) == count($this->pending)) {
+            return;
+        }
+        $this->pending = $kept;
+        $this->savePending();
+    }
+
+    /* Écrit la liste (atomique, 0600) ; liste vide : fichier supprimé. Une
+     * erreur d'écriture est signalée sans interrompre l'émission. */
+    protected function savePending(): void {
+        $file = $this->options['stateFile'];
+        if (count($this->pending) == 0) {
+            if (file_exists($file) && !@unlink($file)) {
+                $this->log('warning', "Impossible de supprimer le fichier d'état DNS " . $file);
+            }
+            return;
+        }
+        $dir = dirname($file);
+        if (!is_dir($dir) && !@mkdir($dir, 0700, true)) {
+            $this->log('warning', "Impossible de créer le dossier du fichier d'état DNS : " . $dir);
+            return;
+        }
+        $json = json_encode(array('version' => self::STATE_VERSION, 'records' => array_values($this->pending)),
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        // tempnam() crée le fichier en 0600, dans le même dossier (rename atomique).
+        $tmp = @tempnam($dir, '.dns_pending.');
+        if ($tmp === false || realpath(dirname($tmp)) !== realpath($dir)) {
+            if (is_string($tmp)) {
+                @unlink($tmp);
+            }
+            $this->log('warning', "Impossible d'écrire le fichier d'état DNS dans " . $dir);
+            return;
+        }
+        @chmod($tmp, 0600);
+        if (@file_put_contents($tmp, $json . "\n") === false || !@rename($tmp, $file)) {
+            @unlink($tmp);
+            $this->log('warning', "Impossible d'écrire le fichier d'état DNS " . $file);
+            return;
+        }
+        @chmod($file, 0600);
     }
 
     /*

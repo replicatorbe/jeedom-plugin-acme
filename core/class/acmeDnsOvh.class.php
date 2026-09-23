@@ -245,8 +245,59 @@ class acmeDnsOvh implements acmeDnsProvider {
     public function removeTxt(string $fqdn, string $value): void {
         $this->requireCredentials();
         $loc = $this->locate($fqdn);
-        $zonePath = '/domain/zone/' . rawurlencode($loc['zone']);
+        if ($this->removeMatching($loc, $value) == 0) {
+            $this->log('debug', 'OVH : aucun TXT à retirer pour ' . $fqdn);
+        }
+    }
 
+    /*
+     * Méthode facultative (voir acmeDnsProvider) : identifiant OVH du TXT posé
+     * par addTxt() sur ce nom avec cette valeur, ou null.
+     */
+    public function recordId(string $fqdn, string $value): ?string {
+        $loc = $this->locate($fqdn);
+        foreach ($this->created as $c) {
+            if ($c['zone'] === $loc['zone'] && $c['sub'] === $loc['sub'] && $c['value'] === $value && $c['id'] !== null) {
+                return (string) $c['id'];
+            }
+        }
+        return null;
+    }
+
+    /*
+     * Méthode facultative (voir acmeDnsProvider) : retire l'enregistrement
+     * d'identifiant connu, après avoir vérifié qu'il s'agit toujours du même
+     * TXT (nom et valeur). Renvoie false si OVH ne le connaît plus. Si
+     * l'identifiant désigne autre chose, retombe sur la recherche par nom et
+     * valeur exacte.
+     */
+    public function removeTxtById(string $fqdn, string $value, string $id): bool {
+        $this->requireCredentials();
+        $loc = $this->locate($fqdn);
+        $zonePath = '/domain/zone/' . rawurlencode($loc['zone']);
+        try {
+            $rec = $this->call('GET', $zonePath . '/record/' . rawurlencode($id));
+        } catch (acmeException $e) {
+            if ($e->getCode() != 404) {
+                throw $e;
+            }
+            $this->log('debug', 'OVH : TXT id ' . $id . ' déjà absent');
+            return false;
+        }
+        $same = is_array($rec) && isset($rec['target'])
+            && (!isset($rec['fieldType']) || strtoupper((string) $rec['fieldType']) === 'TXT')
+            && (!isset($rec['subDomain']) || strtolower((string) $rec['subDomain']) === $loc['sub'])
+            && self::sameTarget((string) $rec['target'], $value);
+        if (!$same) {
+            $this->log('debug', "OVH : l'id " . $id . ' ne désigne plus ce TXT, recherche par nom et valeur');
+            return $this->removeMatching($loc, $value) > 0;
+        }
+        return $this->deleteIds($loc, array($id)) > 0;
+    }
+
+    /* Retire les TXT de ce nom portant exactement cette valeur ; renvoie le
+     * nombre d'enregistrements supprimés. */
+    protected function removeMatching(array $loc, string $value): int {
         // Identifiants retenus à la création.
         $ids = array();
         foreach ($this->created as $i => $c) {
@@ -266,32 +317,43 @@ class acmeDnsOvh implements acmeDnsProvider {
             foreach ($records as $id => $target) {
                 if (self::sameTarget($target, $value)) {
                     $ids[] = $id;
-                    unset($this->listed[$key][$id]);
                 }
             }
         }
+        return $this->deleteIds($loc, $ids);
+    }
 
-        if (count($ids) == 0) {
-            $this->log('debug', 'OVH : aucun TXT à retirer pour ' . $fqdn);
-            return;
-        }
+    /* Supprime des enregistrements par identifiant (404 toléré) ; renvoie le
+     * nombre effectivement supprimés. */
+    protected function deleteIds(array $loc, array $ids): int {
+        $zonePath = '/domain/zone/' . rawurlencode($loc['zone']);
+        $key = $loc['zone'] . '|' . $loc['sub'];
+        $deleted = 0;
         foreach ($ids as $id) {
             try {
                 $this->call('DELETE', $zonePath . '/record/' . rawurlencode((string) $id));
                 $this->log('info', 'OVH : TXT retiré de la zone ' . $loc['zone'] . ' (id ' . $id . ')');
+                $deleted++;
+                $this->touched[$loc['zone']] = true;
             } catch (acmeException $e) {
                 if ($e->getCode() != 404) {
                     throw $e;
                 }
                 $this->log('debug', 'OVH : TXT id ' . $id . ' déjà absent');
             }
+            unset($this->listed[$key][$id]);
+            foreach ($this->created as $i => $c) {
+                if ((string) $c['id'] === (string) $id) {
+                    unset($this->created[$i]);
+                }
+            }
         }
-        $this->touched[$loc['zone']] = true;
+        return $deleted;
     }
 
     /*
      * Méthode facultative (voir acmeDnsProvider) : valeurs des TXT présents
-     * sur ce nom, sans guillemets.
+     * sur ce nom, sans guillemets (journal seulement).
      */
     public function listTxt(string $fqdn): array {
         $this->requireCredentials();

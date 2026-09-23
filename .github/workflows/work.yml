@@ -1,13 +1,63 @@
-# Contrôles de conformité du plugin (syntaxe PHP, structure, info.json).
-# Workflow réutilisable maintenu par Jeedom, utilisé par les plugins officiels.
+# Intégration continue du plugin acme.
+#  - plugin : syntaxe PHP (php -l sous 7.4, 8.0 et 8.2), par le workflow
+#    réutilisable maintenu par Jeedom, utilisé par les plugins officiels.
+#  - tests : exécution des tests hors ligne du plugin sous chaque version de PHP
+#    prise en charge. « php -l » ne voit pas une fonction PHP 8 appelée sous
+#    PHP 7.4 (str_contains…) : seule l'exécution la révèle.
+#    Ne tournent pas ici : tests/test_staging.php (vrai staging Let's Encrypt,
+#    domaine réel requis) et tests/check-classes.php (Jeedom installé requis).
 name: 'Full Workflows Plugin Jeedom'
 
 on:
   push:
-    branches: [beta]
+    branches: [beta, 'ci-*']
   pull_request:
     branches: [beta, master]
+  workflow_dispatch:
 
 jobs:
   plugin:
     uses: jeedom/workflows/.github/workflows/plugin.yml@main
+
+  tests:
+    name: Tests hors ligne (PHP ${{ matrix.php }})
+    runs-on: ubuntu-24.04  # épinglé : PHP 7.4 doit rester disponible (ubuntu-latest passe à Ubuntu 26 en octobre 2026)
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.0', '8.2', '8.4']
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: openssl, curl, json
+          coverage: none
+          tools: none
+
+      - name: Outils (busybox pour la seconde passe du script shell)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox
+          php -v
+          openssl version
+          ls -l /bin/sh
+
+      - name: acmeCrypto
+        run: php tests/test_crypto.php
+
+      - name: Fournisseur DNS OVHcloud (transport simulé)
+        run: php tests/test_ovh.php
+
+      - name: Solveurs (hors ligne)
+        run: php tests/test_solvers.php --offline
+
+      - name: Sonde TLS locale
+        run: php tests/test_probe.php
+
+      - name: Script serveur web et acmeInstaller (sh = dash)
+        run: sh tests/test_webserver.sh
+
+      - name: Script serveur web (busybox sh)
+        run: TEST_SHELL="busybox sh" sh tests/test_webserver.sh

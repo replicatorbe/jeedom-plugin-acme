@@ -146,7 +146,9 @@ class acmeSolverHttp extends acmeSolver {
 
 class acmeSolverDns extends acmeSolver {
     // options : 'propagationTimeout' (s, défaut 300), 'pollInterval' (s, défaut 10),
-    //           'checkPropagation' (bool, défaut true), 'extraDelay' (s, défaut 0)
+    //           'checkPropagation' (bool, défaut true), 'extraDelay' (s, défaut 0),
+    //           'stateFile' (chemin JSON des TXT posés par le plugin et pas encore
+    //           retirés : seuls ceux-là sont nettoyés, jamais un TXT d'un autre outil)
     public function __construct(acmeDnsProvider $provider, array $options = array());
     // TXT '_acme-challenge.<domain>' = b64url(sha256(keyAuthorization))
 }

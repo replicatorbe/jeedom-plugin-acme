@@ -326,6 +326,21 @@ the web server", remove that `include`.
   authority at a fixed time.
 - If automatic installation is enabled, the new certificate is reinstalled in
   the web server.
+- **Check of the certificate actually served.** The plugin knows what it
+  installed, but not necessarily what the web server answers (another site
+  configured on the same port, restored configuration, server not reloaded).
+  Every day, after each installation and each time the device is saved, it
+  therefore connects over HTTPS to `127.0.0.1` on the local HTTPS port,
+  announcing the main name, and compares the serial number of the certificate
+  presented with the one of the current certificate. The result is shown on
+  the page ("Certificate served by the web server") and in the "Certificate
+  served" command. The check only runs when the certificate is supposed to be
+  served (automatic installation enabled, or installed with the button). If it
+  fails — another certificate presented, or server unreachable — the plugin
+  writes a warning to the log and a message to the message center, triggers
+  the "Web server installation failed" notifications, and starts the
+  installation again (except with nginx in manual mode, where the include
+  still has to be done by hand).
 - On failure, the error is kept in the "Last error" command and the status
   becomes `error`.
 - If the certificate expires in fewer than **14 days** ("Alert before expiry",
@@ -367,6 +382,18 @@ Tags available in the options: `#equipement#` (device), `#domaines#`
 A failed notification (deleted command, mail service down) is written to the
 `acme` log.
 
+### Health page
+
+Jeedom's **Analysis → Health** page shows an ACME section:
+
+- one line per enabled device: state (OK, renewal due, expired, error), days
+  left, next renewal date, last error, and certificate served by the web
+  server (result of the last check, no new connection when displayed);
+- the **daily task**: Jeedom task engine enabled, `plugin::cronDaily` task
+  enabled, and the plugin's cronDaily feature enabled (Plugins → Plugin
+  management → ACME). Without it, nothing is renewed;
+- **sudo rights**, if a device installs its certificate in the web server.
+
 ## Commands
 
 | Command | Type | Content |
@@ -374,14 +401,21 @@ A failed notification (deleted command, mail service down) is written to the
 | Status | info | `none` (no certificate), `valid`, `renew_soon` (renewal due), `expired`, `error` (last issuance or renewal failed) |
 | Expiry | info | expiry date, `YYYY-MM-DD HH:MM` |
 | Days left | numeric info | days until expiry, historized |
+| Next renewal | info | planned date of the next renewal, `YYYY-MM-DD`; empty without a certificate |
 | Issuer | info | intermediate authority that signed the certificate |
 | Last renewal | info | date of the last successful issuance |
+| Certificate served | binary info | 1 if the web server does serve this certificate, 0 otherwise (another certificate, or server unreachable); left empty when the certificate is not meant to be installed |
 | Last error | info | last error message, empty when all is well |
 | Renew | action | forces an immediate renewal (background task) |
 | Install in the web server | action | reinstalls the current certificate in the web server |
 
 Example scenario: trigger `#[Home][Certificate][Days left]# < 10`, action:
-phone notification.
+phone notification. Another example: trigger
+`#[Home][Certificate][Certificate served]# == 0`.
+
+Commands added by a plugin update are created on existing devices during the
+update (or the next time the device is saved), at their place in the list if
+you have not reordered the commands, otherwise at the end.
 
 ## Clean uninstall
 

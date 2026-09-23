@@ -40,9 +40,16 @@ Première version.
   déclenchées par l'expiration proche, un échec d'émission, un échec
   d'installation ou un renouvellement réussi, avec étiquettes (#domaines#,
   #jours#, #message#…) et bouton « Tester les notifications ».
-- Commandes : statut, expiration, jours restants (historisée), émetteur,
-  dernier renouvellement, dernière erreur ; actions Renouveler et Installer
-  dans le serveur web.
+- Commandes : statut, expiration, jours restants (historisée), prochain
+  renouvellement, émetteur, dernier renouvellement, certificat servi,
+  dernière erreur ; actions Renouveler et Installer dans le serveur web.
+- Contrôle du certificat réellement servi par le serveur web (sonde TLS
+  locale avec SNI, comparaison du numéro de série) : chaque jour, après chaque
+  installation et à chaque enregistrement ; en cas d'écart ou de serveur
+  injoignable, avertissement, message, notification et nouvelle installation.
+- Page Santé : une ligne par certificat (état, jours restants, prochain
+  renouvellement, dernière erreur, certificat servi), la tâche quotidienne de
+  Jeedom et les droits sudo.
 - Téléchargement des fichiers PEM (fullchain, clé, certificat, chaîne), réservé
   aux administrateurs.
 - Parcours guidé sur la page : essai, émission, installation, vérification de

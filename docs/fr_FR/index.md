@@ -340,6 +340,21 @@ de recharger nginx. Avant « Désinstaller du serveur web », retirez cet
   solliciter l'autorité à heure fixe.
 - Si l'installation automatique est cochée, le nouveau certificat est
   réinstallé dans le serveur web.
+- **Contrôle du certificat réellement servi.** Le plugin sait ce qu'il a
+  installé, mais pas forcément ce que le serveur web répond (autre site
+  configuré sur le même port, configuration restaurée, serveur pas rechargé).
+  Chaque jour, après chaque installation, et à chaque enregistrement de
+  l'équipement, il se connecte donc en HTTPS à `127.0.0.1` sur le port HTTPS
+  local, en annonçant le nom principal, et compare le numéro de série du
+  certificat présenté à celui du certificat en place. Le résultat est affiché
+  sur la page (« Certificat servi par le serveur web ») et dans la commande
+  « Certificat servi ». Ce contrôle n'a lieu que si le certificat est censé
+  être servi (installation automatique cochée, ou installation faite par le
+  bouton). S'il échoue — autre certificat présenté, ou serveur injoignable —
+  le plugin écrit un avertissement dans le journal, un message dans le centre
+  de messages, déclenche les notifications « Échec d'installation dans le
+  serveur web », et relance l'installation (sauf sous nginx en mode manuel, où
+  l'inclusion reste à faire à la main).
 - En cas d'échec, l'erreur est gardée dans la commande « Dernière erreur » et
   le statut passe à `error`.
 - Si le certificat expire dans moins de **14 jours** (« Alerter avant
@@ -385,6 +400,20 @@ détail : erreur, date…). Exemple de message :
 Une notification en échec (commande supprimée, service de mail en panne) est
 écrite dans le journal `acme`.
 
+### Page Santé
+
+La page **Analyse → Santé** de Jeedom affiche une section ACME :
+
+- une ligne par équipement actif : état (OK, à renouveler, expiré, erreur),
+  jours restants, date du prochain renouvellement, dernière erreur, et
+  certificat servi par le serveur web (résultat du dernier contrôle, sans
+  nouvelle connexion à l'affichage) ;
+- la **tâche quotidienne** : moteur de tâches de Jeedom actif, tâche
+  `plugin::cronDaily` active, et fonctionnalité cronDaily du plugin active
+  (Plugins → Gestion des plugins → ACME). Sans elle, rien n'est renouvelé ;
+- les **droits sudo**, si un équipement installe son certificat dans le
+  serveur web.
+
 ## Commandes
 
 | Commande | Type | Contenu |
@@ -392,14 +421,22 @@ Une notification en échec (commande supprimée, service de mail en panne) est
 | Statut | info | `none` (aucun certificat), `valid`, `renew_soon` (renouvellement dû), `expired`, `error` (dernière émission ou dernier renouvellement en échec) |
 | Expiration | info | date d'expiration, `AAAA-MM-JJ HH:MM` |
 | Jours restants | info numérique | jours avant l'expiration, historisée |
+| Prochain renouvellement | info | date prévue du prochain renouvellement, `AAAA-MM-JJ` ; vide sans certificat |
 | Émetteur | info | autorité intermédiaire qui a signé le certificat |
 | Dernier renouvellement | info | date de la dernière émission réussie |
+| Certificat servi | info binaire | 1 si le serveur web sert bien ce certificat, 0 sinon (autre certificat, ou serveur injoignable) ; laissée vide si le certificat n'est pas censé être installé |
 | Dernière erreur | info | message de la dernière erreur, vide si tout va bien |
 | Renouveler | action | force un renouvellement immédiat (tâche de fond) |
 | Installer dans le serveur web | action | réinstalle le certificat en place dans le serveur web |
 
 Exemple de scénario : déclencheur `#[Maison][Certificat][Jours restants]# < 10`,
-action : notification sur le téléphone.
+action : notification sur le téléphone. Autre exemple : déclencheur
+`#[Maison][Certificat][Certificat servi]# == 0`.
+
+Les commandes ajoutées par une mise à jour du plugin sont créées sur les
+équipements existants à la mise à jour (ou au prochain enregistrement de
+l'équipement), à leur place dans la liste si vous n'avez pas réordonné les
+commandes, sinon à la fin.
 
 ## Désinstallation propre
 

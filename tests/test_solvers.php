@@ -509,45 +509,224 @@ try {
 check('CNAME vers une zone inaccessible : erreur claire', $msg !== null && strpos($msg, 'CNAME vers x.autre.example') !== false
     && strpos($msg, 'Aucune zone DNS') !== false, (string) $msg);
 
-// TXT ACME orphelins d'un essai interrompu : retirés au premier prepare() pour ce nom.
-$fq = '_acme-challenge.jeedom.example.org';
-$orphan1 = str_repeat('a', 20) . '_' . str_repeat('B', 21) . '-';           // 43 caractères
-$orphan2 = '"' . str_repeat('Z', 43) . '"';
-$fake = new fakeDnsProviderFull(array());
-$fake->zone[$fq] = array($orphan1, $orphan2, 'google-site-verification=abc', str_repeat('x', 42), str_repeat('y', 44));
-$dns = new testSolverDns($fake, array());
-$logs = array();
-$dns->setLogger($logger);
-$dns->prepare('jeedom.example.org', 't', 't.k');
-$dns->prepare('jeedom.example.org', 't2', 't2.k');
-$lists = array_filter($fake->calls, function ($c) { return $c[0] === 'list'; });
-$rems = array_values(array_filter($fake->calls, function ($c) { return $c[0] === 'remove'; }));
-check('orphelins : liste lue une seule fois par nom', count($lists) == 1);
-check('orphelins : les deux valeurs ACME retirées (guillemets ôtés)', count($rems) == 2 && $rems[0][2] === $orphan1
-    && $rems[1][2] === str_repeat('Z', 43), json_encode($rems));
-check('orphelins : autres TXT conservés', in_array('google-site-verification=abc', $fake->zone[$fq], true)
-    && in_array(str_repeat('x', 42), $fake->zone[$fq], true) && in_array(str_repeat('y', 44), $fake->zone[$fq], true));
-check('orphelins : retrait avant l\'ajout des nouvelles valeurs', $fake->calls[1][0] === 'remove' && $fake->calls[3][0] === 'add');
-check('orphelins : retrait journalisé', count(array_filter($logs, function ($l) { return strpos($l[1], 'orphelin') !== false; })) == 2);
-$dns->cleanup();
-
-// Orphelins retirés puis échec de addTxt : le retrait est quand même publié.
-$fake = new fakeDnsProviderFull(array());
-$fake->zone[$fq] = array($orphan1);
-$fake->failAddOn = acmeSolverDns::recordValue('t.k');
-$dns = new testSolverDns($fake, array());
-try {
-    $dns->prepare('jeedom.example.org', 't', 't.k');
-} catch (acmeException $e) {
+/* Fournisseur à identifiants : méthodes facultatives recordId() et removeTxtById(). */
+class fakeDnsProviderIds extends fakeDnsProviderFull {
+    public $ids = array();            // id => [fqdn, valeur]
+    public $nextId = 500;
+    public $failRemoveById = false;
+    public function addTxt(string $fqdn, string $value): void {
+        parent::addTxt($fqdn, $value);
+        $this->ids[(string) ++$this->nextId] = array($fqdn, $value);
+    }
+    public function recordId(string $fqdn, string $value): ?string {
+        foreach ($this->ids as $id => $r) {
+            if ($r === array($fqdn, $value)) {
+                return (string) $id;
+            }
+        }
+        return null;
+    }
+    public function removeTxtById(string $fqdn, string $value, string $id): bool {
+        $this->calls[] = array('removeById', $fqdn, $value, $id);
+        if ($this->failRemoveById) {
+            throw new acmeException('API injoignable (simulé)');
+        }
+        if (!isset($this->ids[$id])) {
+            return false;
+        }
+        unset($this->ids[$id]);
+        $this->zone[$fqdn] = array_values(array_diff(isset($this->zone[$fqdn]) ? $this->zone[$fqdn] : array(), array($value)));
+        return true;
+    }
 }
-$dns->cleanup();
-check('orphelins : cleanup publie la zone', end($fake->calls) === array('commit'));
 
-// Fournisseur sans listTxt() : aucune recherche d'orphelins.
+function callsOf(array $calls, string $kind): array {
+    return array_values(array_filter($calls, function ($c) use ($kind) { return $c[0] === $kind; }));
+}
+
+function readState(string $file): ?array {
+    if (!is_file($file)) {
+        return null;
+    }
+    $d = json_decode((string) file_get_contents($file), true);
+    return is_array($d) ? $d : null;
+}
+
+$fq = '_acme-challenge.jeedom.example.org';
+$foreign1 = str_repeat('a', 20) . '_' . str_repeat('B', 21) . '-';          // 43 caractères : forme ACME
+$foreign2 = '"' . str_repeat('Z', 43) . '"';
+$stateDir = sys_get_temp_dir() . '/acme-test-state-' . bin2hex(random_bytes(4));
+$stateFile = $stateDir . '/certs/7/dns_pending.json';
+
+// TXT « étrangers » de forme ACME (certbot sur le même nom) : jamais retirés,
+// avec ou sans fichier d'état ; signalés au journal (debug).
+foreach (array('sans stateFile' => array(), 'avec stateFile vide' => array('stateFile' => $stateFile)) as $case => $opts) {
+    $fake = new fakeDnsProviderFull(array());
+    $fake->zone[$fq] = array($foreign1, $foreign2, 'google-site-verification=abc');
+    $dns = new testSolverDns($fake, $opts);
+    $logs = array();
+    $dns->setLogger($logger);
+    $dns->prepare('jeedom.example.org', 't', 't.k');
+    $dns->prepare('jeedom.example.org', 't2', 't2.k');
+    $dns->waitReady();
+    $dns->cleanup();
+    $rems = callsOf($fake->calls, 'remove');
+    $mine = array(acmeSolverDns::recordValue('t.k'), acmeSolverDns::recordValue('t2.k'));
+    check("TXT étrangers ($case) : seules nos valeurs retirées",
+        count($rems) == 2 && in_array($rems[0][2], $mine, true) && in_array($rems[1][2], $mine, true), json_encode($rems));
+    check("TXT étrangers ($case) : toujours présents", $fake->zone[$fq] === array($foreign1, $foreign2, 'google-site-verification=abc'),
+        json_encode($fake->zone[$fq]));
+    check("TXT étrangers ($case) : liste lue une seule fois par nom", count(callsOf($fake->calls, 'list')) == 1);
+    $noted = array_filter($logs, function ($l) { return $l[0] === 'debug' && strpos($l[1], "TXT d'un autre outil laissé en place") !== false; });
+    check("TXT étrangers ($case) : journal debug « laissé en place » (x2)", count($noted) == 2, json_encode($logs));
+}
+check('stateFile : supprimé une fois tout retiré', !file_exists($stateFile));
+
+// Fournisseur sans listTxt() : seulement addTxt.
 $fake = new fakeDnsProvider(array());
 $dns = new testSolverDns($fake, array());
 $dns->prepare('jeedom.example.org', 't', 't.k');
 check('sans listTxt() : seulement addTxt', $fake->calls === array(array('add', $fq, acmeSolverDns::recordValue('t.k'))));
+
+// Tâche interrompue (ni waitReady ni cleanup) : le fichier d'état liste les TXT
+// posés, avec l'identifiant fournisseur, en 0600.
+$fake = new fakeDnsProviderIds(array());
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$dns->cnames['_acme-challenge.www.example.org'] = 'www.acme-deleg.example';
+$dns->prepare('jeedom.example.org', 't', 't.k');
+$dns->prepare('www.example.org', 'w', 'w.k');
+$v1 = acmeSolverDns::recordValue('t.k');
+$v2 = acmeSolverDns::recordValue('w.k');
+$state = readState($stateFile);
+check('stateFile : écrit, version 1, deux entrées', is_array($state) && $state['version'] === 1 && count($state['records']) == 2,
+    (string) @file_get_contents($stateFile));
+check('stateFile : fqdn réellement écrit (cible du CNAME), valeur, id, date',
+    is_array($state) && $state['records'][0]['fqdn'] === $fq && $state['records'][0]['value'] === $v1
+    && $state['records'][0]['id'] === '501' && $state['records'][1]['fqdn'] === 'www.acme-deleg.example'
+    && $state['records'][1]['id'] === '502' && preg_match('/^\d{4}-\d\d-\d\dT/', $state['records'][0]['created']) === 1,
+    json_encode($state));
+check('stateFile : droits 0600', (fileperms($stateFile) & 0777) === 0600, sprintf('%o', fileperms($stateFile) & 0777));
+check('stateFile : aucun fichier temporaire laissé', count(glob(dirname($stateFile) . '/.dns_pending.*')) == 0);
+
+// Tâche suivante : les restes listés sont retirés (par identifiant) au premier
+// prepare(), les TXT étrangers restent ; l'un des restes a déjà disparu (retiré à la main).
+$fake2 = new fakeDnsProviderIds(array());
+$fake2->nextId = 600;
+$fake2->zone = $fake->zone;
+$fake2->zone[$fq][] = $foreign1;
+$fake2->ids = array('501' => array($fq, $v1));    // 502 inconnu du fournisseur
+$dns = new testSolverDns($fake2, array('stateFile' => $stateFile));
+$logs = array();
+$dns->setLogger($logger);
+$dns->prepare('jeedom.example.org', 'n', 'n.k');
+$byId = callsOf($fake2->calls, 'removeById');
+check('restes : retirés par identifiant, avant tout ajout',
+    count($byId) == 2 && $byId[0][3] === '501' && $byId[1][3] === '502' && $byId[1][1] === 'www.acme-deleg.example'
+    && $fake2->calls[0][0] === 'removeById' && $fake2->calls[1][0] === 'removeById', json_encode($fake2->calls));
+check('restes : TXT étranger conservé', in_array($foreign1, $fake2->zone[$fq], true) && !in_array($v1, $fake2->zone[$fq], true));
+check('restes : journal « Reste d\'une tâche précédente retiré »',
+    count(array_filter($logs, function ($l) { return $l[0] === 'info' && strpos($l[1], "Reste d'une tâche précédente retiré : _acme-challenge.jeedom.example.org = ") === 0; })) == 1,
+    json_encode($logs));
+check('reste déjà disparu : retiré de la liste sans erreur',
+    count(array_filter($logs, function ($l) { return strpos($l[1], 'déjà absent chez le fournisseur') !== false; })) == 1
+    && levelCount($logs, 'warning') == 0 && levelCount($logs, 'error') == 0, json_encode($logs));
+$state = readState($stateFile);
+check('restes : liste réduite à la nouvelle valeur', is_array($state) && count($state['records']) == 1
+    && $state['records'][0]['value'] === acmeSolverDns::recordValue('n.k') && $state['records'][0]['id'] === '601',
+    json_encode($state));
+check('restes : TXT étranger signalé en debug',
+    count(array_filter($logs, function ($l) use ($foreign1) { return $l[0] === 'debug' && strpos($l[1], "laissé en place : _acme-challenge.jeedom.example.org = $foreign1") !== false; })) == 1);
+$dns->prepare('www.example.org', 'w2', 'w2.k');
+check('restes : traités une seule fois par tâche', count(callsOf($fake2->calls, 'removeById')) == 2);
+$dns->cleanup();
+check('restes : cleanup publie la zone et vide la liste', end($fake2->calls) === array('commit') && !file_exists($stateFile));
+
+// Fournisseur sans identifiants : reste retiré par nom et valeur exacte.
+$fake = new fakeDnsProviderFull(array());
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$dns->prepare('jeedom.example.org', 't', 't.k');       // interrompu
+$fake->zone[$fq][] = $foreign1;
+$fake->calls = array();
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$logs = array();
+$dns->setLogger($logger);
+$dns->prepare('jeedom.example.org', 'u', 'u.k');
+$rems = callsOf($fake->calls, 'remove');
+check('sans removeTxtById : reste retiré par removeTxt(nom, valeur)', count($rems) == 1 && $rems[0][1] === $fq && $rems[0][2] === $v1
+    && $fake->calls[0][0] === 'remove', json_encode($fake->calls));
+check('sans removeTxtById : TXT étranger conservé', in_array($foreign1, $fake->zone[$fq], true));
+$dns->cleanup();
+
+// Retrait d'un reste en échec : avertissement, l'entrée reste listée (nouvel essai).
+$fake = new fakeDnsProviderIds(array());
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$dns->prepare('jeedom.example.org', 't', 't.k');       // interrompu
+$fake->failRemoveById = true;
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$logs = array();
+$dns->setLogger($logger);
+$dns->prepare('jeedom.example.org', 'u', 'u.k');
+$state = readState($stateFile);
+check('reste en échec : avertissement', levelCount($logs, 'warning') == 1, json_encode($logs));
+check('reste en échec : toujours listé, avec la nouvelle valeur', is_array($state) && count($state['records']) == 2
+    && $state['records'][0]['value'] === $v1, json_encode($state));
+$fake->failRemoveById = false;
+$dns->cleanup();
+check('reste en échec : cleanup ne retire que la valeur de la tâche', count(readState($stateFile)['records']) == 1);
+@unlink($stateFile);
+
+// Échec de addTxt : l'entrée écrite avant l'appel est retirée par cleanup().
+$fake = new fakeDnsProviderIds(array());
+$fake->failAddOn = acmeSolverDns::recordValue('t.k');
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$listedBefore = false;
+try {
+    $dns->prepare('jeedom.example.org', 't', 't.k');
+} catch (acmeException $e) {
+    $listedBefore = is_array(readState($stateFile)) && readState($stateFile)['records'][0]['id'] === null;
+}
+check('écriture avant addTxt : entrée listée (sans id) malgré l\'échec', $listedBefore);
+$dns->cleanup();
+check('échec de addTxt : cleanup vide la liste', !file_exists($stateFile));
+
+// Retrait en échec au cleanup : l'entrée reste listée pour la tâche suivante.
+$fake = new fakeDnsProvider(array());
+$fake->failRemove = true;
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$dns->prepare('jeedom.example.org', 't', 't.k');
+$dns->cleanup();
+check('retrait en échec au cleanup : entrée conservée', is_array(readState($stateFile)) && count(readState($stateFile)['records']) == 1);
+@unlink($stateFile);
+
+// Fichier d'état corrompu : avertissement, traité comme vide, puis réécrit proprement.
+file_put_contents($stateFile, '{"version":1,"records":[{"fqdn":');
+$fake = new fakeDnsProviderFull(array());
+$fake->zone[$fq] = array($foreign1);
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$logs = array();
+$dns->setLogger($logger);
+$threw = false;
+try {
+    $dns->prepare('jeedom.example.org', 't', 't.k');
+} catch (Throwable $e) {
+    $threw = true;
+}
+check('stateFile corrompu : pas d\'exception', !$threw);
+check('stateFile corrompu : avertissement', count(array_filter($logs, function ($l) { return $l[0] === 'warning' && strpos($l[1], 'illisible') !== false; })) == 1,
+    json_encode($logs));
+check('stateFile corrompu : aucun retrait', count(callsOf($fake->calls, 'remove')) == 0 && in_array($foreign1, $fake->zone[$fq], true));
+$state = readState($stateFile);
+check('stateFile corrompu : réécrit avec la nouvelle entrée', is_array($state) && count($state['records']) == 1, (string) @file_get_contents($stateFile));
+$dns->cleanup();
+// Entrées invalides ignorées une à une.
+file_put_contents($stateFile, json_encode(array('version' => 1, 'records' => array('x', array('fqdn' => $fq), array('fqdn' => $fq, 'value' => $v1)))));
+$fake = new fakeDnsProviderFull(array());
+$dns = new testSolverDns($fake, array('stateFile' => $stateFile));
+$dns->prepare('jeedom.example.org', 'u', 'u.k');
+check('stateFile : entrées invalides ignorées, entrée valide retirée', callsOf($fake->calls, 'remove') === array(array('remove', $fq, $v1)),
+    json_encode($fake->calls));
+$dns->cleanup();
+rrmdir($stateDir);
 
 // Serveurs DNS de la zone étrangers au fournisseur : avertissement, une fois par zone.
 $fake = new fakeDnsProviderFull(array());

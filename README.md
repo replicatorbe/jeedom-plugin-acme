@@ -29,7 +29,9 @@ Raspberry Pi OS, Ubuntu, Docker, RHEL et Alpine ; nginx en semi-automatique
 **Renouveler et prévenir.** Chaque jour, au dernier tiers de la durée de vie du
 certificat, en tâche de fond et à une heure étalée. Let's Encrypt n'envoie plus
 d'e-mails d'expiration : si l'échéance approche alors que le renouvellement
-échoue, le plugin crée un message dans Jeedom.
+échoue, le plugin crée un message dans Jeedom. Il vérifie aussi, chaque jour,
+que le serveur web sert bien le certificat en place (sonde TLS locale), et
+réinstalle sinon ; l'état de chaque certificat figure sur la page Santé.
 
 **Sans dépendance.** Ni certbot, ni acme.sh, ni Composer : le protocole ACME
 (RFC 8555) est implémenté en PHP, avec les seules extensions que Jeedom exige
@@ -62,6 +64,7 @@ La documentation complète est dans [docs/fr_FR/index.md](docs/fr_FR/index.md)
 | `core/class/acmeSolver.class.php` | défis HTTP-01 et DNS-01 |
 | `core/class/acmeDns.class.php`, `acmeDnsOvh.class.php` | fournisseurs DNS, vérification de propagation |
 | `core/class/acmeInstaller.class.php`, `resources/acme_webserver.sh` | installation dans le serveur web (script POSIX, en root) |
+| `core/class/acmeProbe.class.php` | sonde TLS : certificat réellement servi par le serveur web |
 | `core/class/acme.class.php` | intégration Jeedom : équipements, commandes, tâches de fond, cron |
 | `core/php/acmeRun.php` | tâche de fond (ligne de commande uniquement) |
 | `core/ajax/acme.ajax.php` | actions de l'interface (administrateurs) |

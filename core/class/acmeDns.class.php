@@ -31,8 +31,15 @@
  * Fournisseur DNS capable de poser et retirer des enregistrements TXT.
  *
  * Méthodes facultatives (hors interface, détectées par method_exists()) :
- *  - listTxt(string $fqdn): array — valeurs TXT présentes sur ce nom ; sert à
- *    retirer les valeurs ACME orphelines d'un essai interrompu ;
+ *  - listTxt(string $fqdn): array — valeurs TXT présentes sur ce nom ; sert
+ *    seulement au journal (TXT d'un autre outil laissés en place) : aucun TXT
+ *    n'est retiré d'après sa forme ;
+ *  - recordId(string $fqdn, string $value): ?string — identifiant, chez le
+ *    fournisseur, du TXT tout juste posé par addTxt() ; retenu dans le
+ *    fichier d'état du solveur ;
+ *  - removeTxtById(string $fqdn, string $value, string $id): bool — retire le
+ *    TXT d'identifiant connu (reste d'une tâche interrompue) ; renvoie false
+ *    si le fournisseur ne le connaît plus ;
  *  - expectedNameServers(): array — suffixes des serveurs DNS du fournisseur
  *    (ex. 'ovh.net') ; sert à avertir quand la zone est servie ailleurs.
  */

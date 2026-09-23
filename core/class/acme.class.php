@@ -40,6 +40,7 @@ require_once __DIR__ . '/acmeSolver.class.php';
 require_once __DIR__ . '/acmeDns.class.php';
 require_once __DIR__ . '/acmeDnsOvh.class.php';
 require_once __DIR__ . '/acmeInstaller.class.php';
+require_once __DIR__ . '/acmeProbe.class.php';
 
 class acme extends eqLogic {
 
@@ -64,6 +65,11 @@ class acme extends eqLogic {
 
     /* Valeur affichée à la place d'un secret pour qui n'est pas administrateur. */
     const SECRET_MASK = '********';
+
+    /* Délai de la sonde TLS du certificat servi (connexion locale : une
+     * réponse prend quelques millisecondes, le délai ne joue que si le
+     * serveur web est bloqué). */
+    const PROBE_TIMEOUT = 5;
 
     /* ============================================================== SÉCURITÉ */
 
@@ -297,7 +303,8 @@ class acme extends eqLogic {
         $state = self::readJson($this->certDir() . '/state.json');
         return array_merge(array('last_renewal' => 0, 'last_attempt' => 0, 'last_error' => '',
                                  'install_error' => '', 'installed_at' => 0, 'installed_serial' => '',
-                                 'installed_mode' => ''), $state);
+                                 'installed_mode' => '', 'served_checked' => 0, 'served_serial' => '',
+                                 'served_error' => '', 'served_port' => 0), $state);
     }
 
     private function writeState(array $changes): void {
@@ -632,7 +639,11 @@ class acme extends eqLogic {
         $this->writeState(array('last_renewal' => time(), 'last_attempt' => time(), 'last_error' => ''));
         message::removeAll('acme', 'expiry::' . $this->getId());
         message::removeAll('acme', 'renew::' . $this->getId());
-        $this->refreshInfo();
+        /* Sans sonde : le serveur web sert encore l'ancien certificat jusqu'à
+         * la réinstallation qui suit, et la commande « Certificat servi »
+         * passerait à 0 quelques secondes à chaque renouvellement — de quoi
+         * déclencher pour rien un scénario qui la surveille. */
+        $this->refreshInfo(false);
 
         /* Réinstallation : si l'installation automatique est cochée, ou si le
          * certificat de cet équipement est celui que sert le serveur web
@@ -920,7 +931,16 @@ class acme extends eqLogic {
             if ($timeout < 30) {
                 $timeout = 300;
             }
-            $solver = new acmeSolverDns($provider, array('propagationTimeout' => $timeout));
+            /* Liste des TXT posés par CE plugin et pas encore retirés : seuls
+             * ceux-là sont nettoyés après une tâche interrompue. Un TXT de même
+             * forme posé par un autre outil sur le même nom (certbot de Home
+             * Assistant, par exemple) n'est jamais touché. Un seul fichier pour
+             * les essais staging et les vraies émissions : les restes des uns
+             * sont nettoyés par les autres. */
+            $solver = new acmeSolverDns($provider, array(
+                'propagationTimeout' => $timeout,
+                'stateFile' => $this->certDir() . '/dns_pending.json',
+            ));
         }
         $solver->setLogger($logger);
         return $solver;
@@ -962,8 +982,47 @@ class acme extends eqLogic {
             throw $e;
         }
         $this->writeState(array('install_error' => ''));
-        $this->refreshInfo();
+        /* Contrôle de ce que le serveur web sert vraiment, sauf en mode
+         * manuel (nginx) : rien n'y est servi tant que l'inclusion n'est pas
+         * faite à la main, l'échec serait attendu. */
+        $mode = isset($result['data']['mode']) ? (string) $result['data']['mode'] : 'auto';
+        if ($mode !== 'manual') {
+            try {
+                $this->verifyServedAfterInstall($this->makeLogger(true));
+            } catch (Throwable $e) {
+                log::add('acme', 'warning', '[' . $this->getName() . '] ' . $e->getMessage());
+            }
+        }
+        $this->refreshInfo($mode !== 'manual');
         return $result;
+    }
+
+    /* Après une installation : sonde, avec quelques nouveaux essais, car un
+     * rechargement en douceur laisse les anciens processus du serveur web
+     * finir leurs connexions, et l'un d'eux peut encore présenter l'ancien
+     * certificat pendant un court instant. Journalise le résultat. */
+    private function verifyServedAfterInstall(callable $logger): void {
+        $probe = array();
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            $probe = $this->probeServed();
+            if (!empty($probe['match'])) {
+                break;
+            }
+            if ($attempt < 3) {
+                sleep(2);
+            }
+        }
+        if (empty($probe['checked'])) {
+            return;
+        }
+        if (!empty($probe['match'])) {
+            $logger('info', __('Contrôle : le serveur web sert bien ce certificat (numéro de série', __FILE__) . ' ' . $probe['serial'] . ').');
+        } elseif ($probe['error'] !== '') {
+            $logger('warning', __('Contrôle : impossible de lire le certificat servi par le serveur web :', __FILE__) . ' ' . $probe['error']);
+        } else {
+            $logger('warning', __('Contrôle : le serveur web sert un autre certificat (numéro de série', __FILE__) . ' ' . $probe['serial']
+                . ', ' . __('attendu', __FILE__) . ' ' . $probe['expected'] . '). ' . __('Un autre site configuré sur ce port passe peut-être devant.', __FILE__));
+        }
     }
 
     /*
@@ -997,7 +1056,7 @@ class acme extends eqLogic {
                 $state = $eqLogic->readState();
                 if (intval($state['installed_at']) > 0 || $state['installed_serial'] !== '') {
                     $eqLogic->writeState(array('installed_at' => 0, 'installed_serial' => '', 'installed_mode' => '', 'install_error' => ''));
-                    $eqLogic->refreshInfo();
+                    $eqLogic->refreshInfo(false);
                     message::removeAll('acme', 'install::' . $eqLogic->getId());
                 }
             } catch (Throwable $e) {
@@ -1084,6 +1143,58 @@ class acme extends eqLogic {
         return implode(' / ', array_slice($all, -$lines));
     }
 
+    /* ======================================================= CERTIFICAT SERVI */
+
+    /* Port HTTPS local du serveur web, borné. */
+    private function getHttpsPort(): int {
+        $port = intval($this->getConfiguration('https_port', 443));
+        return ($port < 1 || $port > 65535) ? 443 : $port;
+    }
+
+    /* Vrai si le serveur web est censé servir le certificat en place : un vrai
+     * certificat (pas du staging), et l'installation automatique cochée ou
+     * une installation faite par le bouton (installed_at). Hors de ce cas, la
+     * question « le serveur web le sert-il ? » n'a pas de sens. */
+    private function servedExpected(array $meta, array $state): bool {
+        if (empty($meta['serial']) || !empty($meta['staging']) || empty($meta['domains'])) {
+            return false;
+        }
+        return $this->getConfiguration('install_webserver', 0) == 1 || intval($state['installed_at']) > 0;
+    }
+
+    /*
+     * Sonde TLS vers 127.0.0.1:<https_port>, avec le nom principal en SNI, et
+     * mémorisation du résultat dans state.json (served_*) : la page Santé et
+     * la page de l'équipement le relisent sans refaire de connexion. Ne sonde
+     * que si le serveur web est censé servir ce certificat.
+     *
+     * Renvoie ['checked' => bool, 'match' => bool, 'serial' => string (servi),
+     *          'expected' => string, 'error' => string]. Ne lève pas pour une
+     * erreur réseau (elle est dans 'error').
+     */
+    public function probeServed(): array {
+        $return = array('checked' => false, 'match' => false, 'serial' => '', 'expected' => '', 'error' => '');
+        if (!is_file($this->certDir() . '/cert.pem')) {
+            return $return;
+        }
+        $meta = $this->readMeta();
+        $state = $this->readState();
+        if (!$this->servedExpected($meta, $state)) {
+            return $return;
+        }
+        $port = $this->getHttpsPort();
+        $probe = new acmeProbe($this->makeLogger(false));
+        $result = $probe->fetch('127.0.0.1', $port, (string) $meta['domains'][0], self::PROBE_TIMEOUT);
+        $return['checked'] = true;
+        $return['serial'] = (string) $result['serial'];
+        $return['error'] = (string) $result['error'];
+        $return['expected'] = acmeProbe::normalizeSerial((string) $meta['serial']);
+        $return['match'] = ($return['error'] === '' && $return['serial'] === $return['expected']);
+        $this->writeState(array('served_checked' => time(), 'served_serial' => $return['serial'],
+                                'served_error' => $return['error'], 'served_port' => $port));
+        return $return;
+    }
+
     /* ================================================================== ÉTAT */
 
     /*
@@ -1115,6 +1226,13 @@ class acme extends eqLogic {
             $info['installed'] = false;
             $info['installed_outdated'] = false;
             $info['install_webserver'] = ($this->getConfiguration('install_webserver', 0) == 1);
+            /* served : résultat du dernier contrôle du certificat réellement
+             * servi (probeServed), relu sans nouvelle connexion. null quand la
+             * question ne se pose pas (rien à servir) ou pas encore contrôlé. */
+            $info['served'] = null;
+            $info['served_serial'] = (string) $state['served_serial'];
+            $info['served_error'] = (string) $state['served_error'];
+            $info['served_checked'] = $state['served_checked'] ? date('Y-m-d H:i:s', $state['served_checked']) : '';
         }
         $certFile = $dir . '/cert.pem';
         if (!is_file($certFile)) {
@@ -1152,6 +1270,14 @@ class acme extends eqLogic {
             $currentSerial = strtolower(ltrim((string) $cert['serial'], '0'));
             $info['installed'] = ($installedSerial !== '' && $installedSerial === $currentSerial);
             $info['installed_outdated'] = !$info['installed'];
+        }
+        if ($this->servedExpected($meta, $state) && intval($state['served_checked']) > 0) {
+            /* Comparé au certificat en place à chaque lecture : un contrôle
+             * antérieur au dernier renouvellement dit « non », à juste titre,
+             * tant que le nouveau n'est pas installé. */
+            $info['served'] = ($info['served_error'] === ''
+                && $info['served_serial'] !== ''
+                && acmeProbe::normalizeSerial($info['served_serial']) === acmeProbe::normalizeSerial((string) $cert['serial']));
         }
         $info['renewalDate'] = date('Y-m-d', $this->renewalTimestamp($cert['notBefore'], $cert['notAfter']));
         $info['renewalReason'] = $this->renewalReason();
@@ -1220,21 +1346,29 @@ class acme extends eqLogic {
 
     /* Vrai si le certificat en place (réel, pas du staging) devrait être servi
      * par le serveur web — installation automatique cochée, ou installé par le
-     * bouton — et que ce n'est pas lui qui y est (numéro de série différent). */
+     * bouton — et que ce n'est pas lui qui y est : numéro de série installé
+     * différent, ou dernier contrôle du certificat réellement servi en échec
+     * (autre certificat présenté, serveur injoignable). Ce second cas ne vaut
+     * pas en mode manuel (nginx) : réinstaller n'y changerait rien, c'est
+     * l'inclusion faite à la main qui manque. */
     public function needsReinstall(): bool {
         $dir = $this->certDir();
         if (!is_file($dir . '/fullchain.pem') || !is_file($dir . '/privkey.pem')) {
             return false;
         }
         $meta = $this->readMeta();
-        if (empty($meta['serial']) || !empty($meta['staging'])) {
-            return false;
-        }
         $state = $this->readState();
-        if ($this->getConfiguration('install_webserver', 0) != 1 && intval($state['installed_at']) <= 0) {
+        if (!$this->servedExpected($meta, $state)) {
             return false;
         }
-        return (string) $state['installed_serial'] !== (string) $meta['serial'];
+        if ((string) $state['installed_serial'] !== (string) $meta['serial']) {
+            return true;
+        }
+        if ($state['installed_mode'] === 'manual') {
+            return false;
+        }
+        $info = $this->getCertificateInfo();
+        return $info['served'] === false;
     }
 
     /* Vrai si un certificat existe et doit être renouvelé (échéance atteinte,
@@ -1246,14 +1380,34 @@ class acme extends eqLogic {
         return $this->renewalReason() !== '';
     }
 
-    /* Met à jour les commandes info d'après le certificat en place. */
-    public function refreshInfo(): array {
+    /*
+     * Met à jour les commandes info d'après le certificat en place.
+     * $probe : contrôle aussi le certificat réellement servi par le serveur
+     * web (sonde TLS locale, quelques millisecondes) et met à jour la commande
+     * « Certificat servi ». Sans sonde, cette commande n'est pas touchée.
+     */
+    public function refreshInfo(bool $probe = true): array {
+        if ($probe) {
+            try {
+                $this->probeServed();
+            } catch (Throwable $e) {
+                log::add('acme', 'warning', '[' . $this->getName() . '] ' . $e->getMessage());
+            }
+        }
         $info = $this->getCertificateInfo();
         $this->checkAndUpdateCmd('status', $info['status']);
         if ($info['exists']) {
             $this->checkAndUpdateCmd('expiration', $info['expiration']);
             $this->checkAndUpdateCmd('days_left', $info['daysLeft']);
             $this->checkAndUpdateCmd('issuer', $info['issuer']);
+        }
+        /* Vide sans certificat (date inconnue) ; un renouvellement dû reste
+         * daté du jour prévu, déjà passé. */
+        $this->checkAndUpdateCmd('next_renewal', $info['exists'] ? (string) $info['renewalDate'] : '');
+        /* Seulement quand la question se pose (served non null) : sinon la
+         * commande reste telle quelle, vide sur un certificat jamais installé. */
+        if ($probe && isset($info['served']) && $info['served'] !== null) {
+            $this->checkAndUpdateCmd('served', $info['served'] ? 1 : 0);
         }
         $this->checkAndUpdateCmd('last_renewal', isset($info['last_renewal']) ? $info['last_renewal'] : '');
         /* La commande « Dernière erreur » montre l'échec d'émission, sinon
@@ -1513,6 +1667,7 @@ class acme extends eqLogic {
                 if (!$info['exists']) {
                     continue;
                 }
+                $eqLogic->checkServedDaily($info);
                 if ($eqLogic->isRenewalDue()) {
                     if (!$eqLogic->isJobRunning()) {
                         $delay = $index * 600 + random_int(60, 3600);
@@ -1549,6 +1704,206 @@ class acme extends eqLogic {
                 log::add('acme', 'error', '[' . $eqLogic->getName() . '] cronDaily : ' . $e->getMessage());
             }
         }
+    }
+
+    /*
+     * Alerte du cron quand le dernier contrôle (fait par refreshInfo juste
+     * avant) dit que le serveur web ne sert pas ce certificat : journal,
+     * message et notification « échec d'installation ». La réinstallation
+     * elle-même est relancée par cronDaily via needsReinstall(). Le message
+     * est retiré dès que le contrôle redevient bon.
+     */
+    private function checkServedDaily(array $info): void {
+        if (!array_key_exists('served', $info) || $info['served'] === null) {
+            return;
+        }
+        if ($info['served'] === true) {
+            if ((string) $info['install_error'] === '') {
+                message::removeAll('acme', 'install::' . $this->getId());
+            }
+            return;
+        }
+        $state = $this->readState();
+        $port = intval($state['served_port']) > 0 ? intval($state['served_port']) : $this->getHttpsPort();
+        if ((string) $info['served_error'] !== '') {
+            $text = __('le serveur web ne répond pas en HTTPS sur le port', __FILE__) . ' ' . $port . ' : ' . $info['served_error'];
+        } else {
+            $text = __('le serveur web ne sert pas ce certificat sur le port', __FILE__) . ' ' . $port . ' ('
+                . __('numéro de série servi', __FILE__) . ' ' . $info['served_serial'] . ', '
+                . __('attendu', __FILE__) . ' ' . acmeProbe::normalizeSerial((string) $info['serial']) . ').';
+        }
+        if ($state['installed_mode'] === 'manual') {
+            $text .= ' ' . __('L\'inclusion du fichier généré dans la configuration du serveur web reste à faire à la main.', __FILE__);
+        } else {
+            $text .= ' ' . __('Nouvelle tentative d\'installation.', __FILE__);
+        }
+        log::add('acme', 'warning', '[' . $this->getName() . '] ' . $text);
+        $this->postMessage('install', $text);
+        $this->notify('install_error', $text);
+    }
+
+    /* ================================================================ SANTÉ */
+
+    /*
+     * Lignes du plugin sur la page Santé de Jeedom (desktop/php/health.php) :
+     * ['test' => libellé, 'result' => HTML, 'advice' => texte de l'infobulle,
+     * 'state' => bool]. Une ligne par équipement actif, puis les prérequis
+     * communs.
+     *
+     * Aucune connexion ici : le certificat servi est celui du dernier contrôle
+     * mémorisé (cron quotidien, page de l'équipement). Ne lève jamais : la
+     * page Santé n'attrape que les Exception, une Error la ferait tomber tout
+     * entière ; toute erreur devient une ligne en échec.
+     */
+    public static function health() {
+        $return = array();
+        $installs = false;
+        try {
+            foreach (self::byType('acme', true) as $eqLogic) {
+                try {
+                    if ($eqLogic->getConfiguration('install_webserver', 0) == 1) {
+                        $installs = true;
+                    }
+                    $line = $eqLogic->healthLine();
+                    if (!empty($line['installs'])) {
+                        $installs = true;
+                    }
+                    unset($line['installs']);
+                    $return[] = $line;
+                } catch (Throwable $e) {
+                    $return[] = array('test' => __('Certificat', __FILE__) . ' ' . self::healthEscape($eqLogic->getName()),
+                                      'result' => __('Erreur :', __FILE__) . ' ' . self::healthEscape($e->getMessage()),
+                                      'advice' => '', 'state' => false);
+                }
+            }
+        } catch (Throwable $e) {
+            $return[] = array('test' => __('Certificats', __FILE__), 'result' => __('Erreur :', __FILE__) . ' ' . self::healthEscape($e->getMessage()),
+                              'advice' => '', 'state' => false);
+        }
+
+        /* Tâche quotidienne : c'est elle qui renouvelle. Trois interrupteurs
+         * dans le coeur : le moteur de tâches (enableCron), la tâche
+         * plugin::cronDaily, et la fonctionnalité cronDaily du plugin
+         * (Plugins → Gestion des plugins → acme → Fonctionnalités). */
+        try {
+            $problems = array();
+            if (config::byKey('enableCron', 'core', 1, true) == 0) {
+                $problems[] = __('moteur de tâches de Jeedom désactivé', __FILE__);
+            }
+            $cron = cron::byClassAndFunction('plugin', 'cronDaily');
+            $lastRun = '';
+            if (!is_object($cron)) {
+                $problems[] = __('tâche plugin::cronDaily absente', __FILE__);
+            } else {
+                if ($cron->getEnable() != 1) {
+                    $problems[] = __('tâche plugin::cronDaily désactivée', __FILE__);
+                }
+                $lastRun = (string) $cron->getLastRun();
+            }
+            if (config::byKey('functionality::cronDaily::enable', 'acme', 1) == 0) {
+                $problems[] = __('fonctionnalité cronDaily du plugin désactivée', __FILE__);
+            }
+            $ok = (count($problems) === 0);
+            $return[] = array(
+                'test' => __('Tâche quotidienne (renouvellement)', __FILE__),
+                'result' => $ok
+                    ? __('OK', __FILE__) . ($lastRun !== '' ? ' (' . __('dernière exécution', __FILE__) . ' ' . self::healthEscape($lastRun) . ')' : '')
+                    : self::healthEscape(ucfirst(implode(', ', $problems))),
+                'advice' => $ok ? '' : __('Sans elle, aucun certificat n’est renouvelé ni surveillé. Réactivez le moteur de tâches (Réglages → Système → Moteur de tâches) et la fonctionnalité cronDaily du plugin (Plugins → Gestion des plugins → ACME).', __FILE__),
+                'state' => $ok,
+            );
+        } catch (Throwable $e) {
+            $return[] = array('test' => __('Tâche quotidienne (renouvellement)', __FILE__), 'result' => __('Erreur :', __FILE__) . ' ' . self::healthEscape($e->getMessage()),
+                              'advice' => '', 'state' => false);
+        }
+
+        /* sudo : l'installation dans le serveur web passe par lui. */
+        if ($installs) {
+            try {
+                $ok = jeedom::isCapable('sudo');
+                $return[] = array(
+                    'test' => __('Droits sudo (installation dans le serveur web)', __FILE__),
+                    'result' => $ok ? __('OK', __FILE__) : __('Non disponible', __FILE__),
+                    'advice' => $ok ? '' : __('Sans sudo, le certificat renouvelé ne peut pas être installé dans le serveur web. Corrigez les droits depuis la page Santé de Jeedom.', __FILE__),
+                    'state' => (bool) $ok,
+                );
+            } catch (Throwable $e) {
+                $return[] = array('test' => __('Droits sudo (installation dans le serveur web)', __FILE__), 'result' => __('Erreur :', __FILE__) . ' ' . self::healthEscape($e->getMessage()),
+                                  'advice' => '', 'state' => false);
+            }
+        }
+        return $return;
+    }
+
+    /* Texte sûr dans le HTML de la page Santé (le coeur l'insère tel quel). */
+    private static function healthEscape(string $text): string {
+        return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
+    }
+
+    /* Ligne de la page Santé pour cet équipement : état, jours restants,
+     * prochain renouvellement, dernière erreur, certificat servi. */
+    private function healthLine(): array {
+        $info = $this->getCertificateInfo();
+        $parts = array();
+        $advice = '';
+        switch ($info['status']) {
+            case 'valid':
+                $parts[] = __('OK', __FILE__);
+                $ok = true;
+                break;
+            case 'renew_soon':
+                $parts[] = __('À renouveler', __FILE__);
+                $ok = true;
+                break;
+            case 'expired':
+                $parts[] = __('Expiré', __FILE__);
+                $ok = false;
+                $advice = __('Le certificat a expiré : lancez « Renouveler maintenant » et consultez le journal acme.', __FILE__);
+                break;
+            case 'error':
+                $parts[] = __('Erreur', __FILE__);
+                $ok = false;
+                $advice = __('La dernière émission a échoué : consultez le journal acme.', __FILE__);
+                break;
+            default:
+                $parts[] = __('Aucun certificat', __FILE__);
+                $ok = false;
+                $advice = __('Obtenez le certificat depuis la page de l’équipement.', __FILE__);
+        }
+        if ($info['exists']) {
+            $parts[] = $info['daysLeft'] . ' ' . __('jours restants', __FILE__);
+            if ($info['renewalDate'] !== '') {
+                $parts[] = __('prochain renouvellement', __FILE__) . ' ' . $info['renewalDate'];
+            }
+        }
+        if ($info['served'] === true) {
+            $parts[] = __('servi par le serveur web', __FILE__);
+        } elseif ($info['served'] === false) {
+            $ok = false;
+            $parts[] = ($info['served_error'] !== '')
+                ? __('serveur web injoignable', __FILE__) . ' (' . $info['served_error'] . ')'
+                : __('le serveur web sert un autre certificat', __FILE__);
+            if ($advice === '') {
+                $advice = __('Le serveur web ne sert pas ce certificat : lancez « Installer dans le serveur web » et vérifiez qu’aucun autre site n’occupe ce port.', __FILE__);
+            }
+        }
+        if ((string) $info['last_error'] !== '') {
+            $parts[] = __('dernière erreur :', __FILE__) . ' ' . $info['last_error'];
+        }
+        if ((string) $info['install_error'] !== '') {
+            $ok = false;
+            $parts[] = __('installation en échec :', __FILE__) . ' ' . $info['install_error'];
+            if ($advice === '') {
+                $advice = __('L’installation dans le serveur web a échoué : consultez le journal acme.', __FILE__);
+            }
+        }
+        return array(
+            'test' => __('Certificat', __FILE__) . ' ' . self::healthEscape($this->getName()),
+            'result' => self::healthEscape(implode(' — ', $parts)),
+            'advice' => $advice,
+            'state' => $ok,
+            'installs' => ($info['installed_at'] !== ''),
+        );
     }
 
     /* ======================================================== ÉQUIPEMENT */
@@ -1636,14 +1991,49 @@ class acme extends eqLogic {
         }
     }
 
-    /* Commandes de l'équipement : créées si absentes, jamais renommées (le
-     * nom appartient à l'utilisateur une fois la commande créée). */
+    /*
+     * Commandes de l'équipement : créées si absentes, jamais renommées (le
+     * nom appartient à l'utilisateur une fois la commande créée).
+     *
+     * Ordre : celui de commandDefinitions(). Sur un équipement existant qui
+     * reçoit une commande nouvelle (mise à jour du plugin), les commandes
+     * sont renumérotées pour que la nouvelle prenne sa place — mais seulement
+     * si l'utilisateur n'a pas déjà réordonné les commandes du plugin ; sinon
+     * son ordre est gardé et la nouvelle va à la fin.
+     */
     public function postSave() {
-        $order = 0;
-        foreach (self::commandDefinitions() as $logicalId => $def) {
-            $order++;
+        $definitions = self::commandDefinitions();
+        $existing = array();
+        foreach ($definitions as $logicalId => $def) {
             $cmd = $this->getCmd(null, $logicalId);
             if (is_object($cmd)) {
+                $existing[$logicalId] = $cmd;
+            }
+        }
+        $renumber = false;
+        $nextOrder = 0;
+        if (count($existing) > 0 && count($existing) < count($definitions)) {
+            $sorted = $existing;
+            uasort($sorted, function ($a, $b) {
+                return intval($a->getOrder()) - intval($b->getOrder());
+            });
+            $renumber = (array_keys($sorted) === array_keys($existing));
+            foreach ($existing as $cmd) {
+                $nextOrder = max($nextOrder, intval($cmd->getOrder()) + 1);
+            }
+        }
+        $order = -1;
+        foreach ($definitions as $logicalId => $def) {
+            $order++;
+            if (isset($existing[$logicalId])) {
+                if ($renumber && intval($existing[$logicalId]->getOrder()) !== $order) {
+                    try {
+                        $existing[$logicalId]->setOrder($order);
+                        $existing[$logicalId]->save();
+                    } catch (Throwable $e) {
+                        log::add('acme', 'debug', 'postSave : ' . $e->getMessage());
+                    }
+                }
                 continue;
             }
             $cmd = new acmeCmd();
@@ -1652,7 +2042,7 @@ class acme extends eqLogic {
             $cmd->setName($def['name']);
             $cmd->setType($def['type']);
             $cmd->setSubType($def['subType']);
-            $cmd->setOrder($order);
+            $cmd->setOrder((count($existing) > 0 && !$renumber) ? $nextOrder++ : $order);
             $cmd->setIsVisible(isset($def['visible']) ? $def['visible'] : 1);
             if (isset($def['unite'])) {
                 $cmd->setUnite($def['unite']);
@@ -1660,7 +2050,14 @@ class acme extends eqLogic {
             if (!empty($def['historized'])) {
                 $cmd->setIsHistorized(1);
             }
-            $cmd->save();
+            try {
+                $cmd->save();
+            } catch (Throwable $e) {
+                /* Nom déjà pris par une commande de l'utilisateur (unicité
+                 * eqLogic_id + name) : l'enregistrement de l'équipement ne doit
+                 * pas échouer pour autant. */
+                log::add('acme', 'error', '[' . $this->getName() . '] ' . __('Création de la commande impossible :', __FILE__) . ' ' . $def['name'] . ' — ' . $e->getMessage());
+            }
         }
         try {
             $this->refreshInfo();
@@ -1709,8 +2106,10 @@ class acme extends eqLogic {
             'status' => array('name' => __('Statut', __FILE__), 'type' => 'info', 'subType' => 'string'),
             'expiration' => array('name' => __('Expiration', __FILE__), 'type' => 'info', 'subType' => 'string'),
             'days_left' => array('name' => __('Jours restants', __FILE__), 'type' => 'info', 'subType' => 'numeric', 'unite' => 'j', 'historized' => 1),
+            'next_renewal' => array('name' => __('Prochain renouvellement', __FILE__), 'type' => 'info', 'subType' => 'string'),
             'issuer' => array('name' => __('Émetteur', __FILE__), 'type' => 'info', 'subType' => 'string', 'visible' => 0),
             'last_renewal' => array('name' => __('Dernier renouvellement', __FILE__), 'type' => 'info', 'subType' => 'string'),
+            'served' => array('name' => __('Certificat servi', __FILE__), 'type' => 'info', 'subType' => 'binary'),
             'last_error' => array('name' => __('Dernière erreur', __FILE__), 'type' => 'info', 'subType' => 'string'),
             'renew' => array('name' => __('Renouveler', __FILE__), 'type' => 'action', 'subType' => 'other'),
             'install' => array('name' => __('Installer dans le serveur web', __FILE__), 'type' => 'action', 'subType' => 'other', 'visible' => 0),

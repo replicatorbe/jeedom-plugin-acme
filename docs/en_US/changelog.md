@@ -38,8 +38,15 @@ First release.
   triggered by approaching expiry, an issuance failure, an installation failure
   or a successful renewal, with tags (#domaines#, #jours#, #message#…) and a
   "Test notifications" button.
-- Commands: status, expiry, days left (historized), issuer, last renewal, last
-  error; Renew and Install in the web server actions.
+- Commands: status, expiry, days left (historized), next renewal, issuer,
+  last renewal, certificate served, last error; Renew and Install in the web
+  server actions.
+- Check of the certificate actually served by the web server (local TLS probe
+  with SNI, serial number comparison): every day, after each installation and
+  on each save; on mismatch or unreachable server, warning, message,
+  notification and new installation.
+- Health page: one line per certificate (state, days left, next renewal, last
+  error, certificate served), the Jeedom daily task and sudo rights.
 - Download of the PEM files (fullchain, key, certificate, chain), for
   administrators only.
 - Guided path on the page: test, issuance, installation, `https://` check,
